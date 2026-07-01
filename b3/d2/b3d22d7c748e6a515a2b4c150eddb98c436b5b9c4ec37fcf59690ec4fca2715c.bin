@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""LUT 'Villeneuve Dune' calee sur le rendu Greig Fraser / Denis Villeneuve.
+
+Caracteristiques visees (d'apres l'image de reference Dune) :
+- noirs LAITEUX releves (aucun vrai noir, look pellicule fade)
+- hautes lumieres rolled-off (pas de blanc pur, plafond sableux)
+- contraste TRES plat
+- desaturation forte (~50%)
+- dominante sable / ambre neutre, ZERO vert
+- ombres a peine froides (gris neutre), moyens/peaux ambre doux
+
+Sortie : VilleneuveDune.cube en 65x65x65 (gros fichier, transitions lisses)."""
+
+import os
+
+N = 65  # haute resolution : gradients sans banding
+OUT = os.path.join(os.path.dirname(__file__), "..", "LUTs", "VilleneuveDune.cube")
+
+# --- Courbe tonale : faded film (noirs releves + hautes lumieres ecretees) ---
+OUT_BLACK = 0.075   # plancher : les noirs montent a ~7.5%
+OUT_WHITE = 0.860   # plafond : les blancs plafonnent a ~86% (rolled off)
+CONTRAST = 0.04     # courbe en S quasi nulle
+PIVOT = 0.48
+
+
+def faded_curve(v):
+    # compression lineaire vers [noir laiteux, blanc ecrete]
+    v = OUT_BLACK + (OUT_WHITE - OUT_BLACK) * v
+    # micro contraste en S (tres doux) autour du pivot
+    x = v - PIVOT
+    v = v + CONTRAST * x * (1 - abs(x) / max(PIVOT, 1 - PIVOT))
+    return max(0.0, min(1.0, v))
+
+
+def smoothstep(a, b, x):
+    if x <= a:
+        return 0.0
+    if x >= b:
+        return 1.0
+    t = (x - a) / (b - a)
+    return t * t * (3 - 2 * t)
+
+
+def grade(r, g, b):
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    shadow = 1.0 - smoothstep(0.0, 0.5, lum)
+    high = smoothstep(0.45, 1.0, lum)
+    mid = max(0.0, 1.0 - abs(lum - 0.45) * 2.2)
+
+    # --- Teinte ambre : R > G > B. Le vert monte MOINS que le rouge => orange,
+    #     jamais jaune-vert. Tout reste tres subtil (desature ensuite). ---
+    warm = 0.055 * mid + 0.040 * high   # chaleur sur moyens + hautes lumieres
+    r += warm
+    g += warm * 0.30                     # green bride : empeche le virage vert
+    b -= warm * 0.85
+
+    # ombres : gris neutre a peine froid (pas de teal marque)
+    r -= 0.012 * shadow
+    g -= 0.004 * shadow
+    b += 0.014 * shadow
+
+    # --- Courbe tonale faded (noirs laiteux, blancs ecretes, plat) ---
+    r = faded_curve(r)
+    g = faded_curve(g)
+    b = faded_curve(b)
+
+    # --- Desaturation forte (look Dune ~50%) ---
+    lum2 = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    sat = 0.52
+    r = lum2 + (r - lum2) * sat
+    g = lum2 + (g - lum2) * sat
+    b = lum2 + (b - lum2) * sat
+
+    return (max(0.0, min(1.0, r)),
+            max(0.0, min(1.0, g)),
+            max(0.0, min(1.0, b)))
+
+
+def main():
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    lines = [
+        "# Villeneuve Dune look - faded film, amber neutre, tres desature",
+        "TITLE \"Villeneuve Dune\"",
+        f"LUT_3D_SIZE {N}",
+        "DOMAIN_MIN 0.0 0.0 0.0",
+        "DOMAIN_MAX 1.0 1.0 1.0",
+        "",
+    ]
+    for ib in range(N):
+        for ig in range(N):
+            for ir in range(N):
+                nr, ng, nb = grade(ir / (N - 1), ig / (N - 1), ib / (N - 1))
+                lines.append(f"{nr:.6f} {ng:.6f} {nb:.6f}")
+    with open(OUT, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("LUT ecrite :", os.path.abspath(OUT), f"({N}^3 = {N**3} entrees)")
+
+
+if __name__ == "__main__":
+    main()
