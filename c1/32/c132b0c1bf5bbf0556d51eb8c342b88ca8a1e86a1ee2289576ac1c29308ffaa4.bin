@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""LUT 'Villeneuve Dune' derive PIXEL PAR PIXEL d'une image de reference.
+
+Principe (transfert de palette par luminance) :
+1. On lit l'image Dune de reference.
+2. Pour chaque niveau de luminosite L, on mesure la couleur MOYENNE (R,G,B)
+   reellement presente dans Dune. Ca donne 3 courbes cR(L),cG(L),cB(L) qui
+   encodent le ton (noirs releves, blancs ecretes) ET le degrade de teinte
+   (ombres brun-gris -> moyens ambre -> hautes lumieres jaune creme).
+3. Le LUT applique :
+   base   = couleur_Dune(L)
+   sortie = base + SAT_RETAIN * (pixel - L)        (retention de couleur)
+   + GREEN_TAME : desature en plus les pixels a dominante verte (desert).
+
+Usage :
+  python3 dune_lut_from_image.py sweep     -> grille de comparaison /tmp
+  python3 dune_lut_from_image.py final A   -> ecrit le .cube avec preset A
+"""
+
+import sys, os
+import numpy as np
+from PIL import Image
+
+REF = "/Users/zenray/Downloads/Dune (1).png"
+OUT = os.path.join(os.path.dirname(__file__), "..", "LUTs", "VilleneuveDune.cube")
+FOOTAGE = "/tmp/footage_frame.png"
+N = 65
+SMOOTH = 5
+REC709 = np.array([0.2126, 0.7152, 0.0722])
+
+# presets nommes (ajustes au fil des iterations)
+PRESETS = {
+    "v1": dict(SAT_RETAIN=0.45, WARM_BOOST=1.00, LIFT_KEEP=1.00, GREEN_TAME=0.0),
+    "A":  dict(SAT_RETAIN=0.40, WARM_BOOST=1.12, LIFT_KEEP=1.00, GREEN_TAME=0.55),
+    "B":  dict(SAT_RETAIN=0.33, WARM_BOOST=1.18, LIFT_KEEP=0.92, GREEN_TAME=0.70),
+    "C":  dict(SAT_RETAIN=0.48, WARM_BOOST=1.08, LIFT_KEEP=1.00, GREEN_TAME=0.40),
+    "D":  dict(SAT_RETAIN=0.37, WARM_BOOST=1.15, LIFT_KEEP=0.96, GREEN_TAME=0.62),
+}
+
+
+def compare(names, w=900):
+    """footage-only, grand, colonnes ORIG | <names...>."""
+    src = load_small(FOOTAGE, w)
+    panels = [src]
+    for nm in names:
+        cR, cG, cB = shaped_curves(PRESETS[nm])
+        panels.append(grade_array(src, cR, cG, cB, PRESETS[nm]))
+    # 2 par ligne pour rester lisible
+    import math
+    per = len(panels)
+    strip = np.concatenate(panels, axis=1)
+    Image.fromarray((strip * 255).astype(np.uint8)).save("/tmp/dune_compare.png")
+    print("compare : /tmp/dune_compare.png  ORIG | " + " | ".join(names))
+
+
+def measure_curves():
+    """cR,cG,cB (256,) : couleur moyenne Dune par niveau de luminance."""
+    arr = np.asarray(Image.open(REF).convert("RGB"), dtype=np.float64) / 255.0
+    px = arr.reshape(-1, 3)
+    lum = px @ REC709
+    bins = np.clip((lum * 255).astype(int), 0, 255)
+    cR = np.zeros(256); cG = np.zeros(256); cB = np.zeros(256); cnt = np.zeros(256)
+    np.add.at(cR, bins, px[:, 0]); np.add.at(cG, bins, px[:, 1])
+    np.add.at(cB, bins, px[:, 2]); np.add.at(cnt, bins, 1.0)
+    valid = cnt > 0; idx = np.arange(256)
+    for c in (cR, cG, cB):
+        c[valid] /= cnt[valid]
+        c[~valid] = np.interp(idx[~valid], idx[valid], c[valid])
+    if SMOOTH > 1:
+        k = np.ones(SMOOTH) / SMOOTH
+        cR = np.convolve(cR, k, "same"); cG = np.convolve(cG, k, "same"); cB = np.convolve(cB, k, "same")
+    return cR, cG, cB
+
+
+def shaped_curves(p):
+    cR, cG, cB = measure_curves()
+    cL = cR * REC709[0] + cG * REC709[1] + cB * REC709[2]
+    # amplifie le cast chaud (separe ton et teinte)
+    cR = cL + (cR - cL) * p["WARM_BOOST"]
+    cG = cL + (cG - cL) * p["WARM_BOOST"]
+    cB = cL + (cB - cL) * p["WARM_BOOST"]
+    if p["LIFT_KEEP"] != 1.0:
+        floor = min(cR[0], cG[0], cB[0])
+        cR -= floor * (1 - p["LIFT_KEEP"]); cG -= floor * (1 - p["LIFT_KEEP"]); cB -= floor * (1 - p["LIFT_KEEP"])
+    return np.clip(cR, 0, 1), np.clip(cG, 0, 1), np.clip(cB, 0, 1)
+
+
+def grade_array(arr, cR, cG, cB, p):
+    """arr float 0..1 HxWx3 -> graded."""
+    L = arr @ REC709
+    xs = np.linspace(0, 1, 256)
+    base = np.stack([np.interp(L, xs, cR), np.interp(L, xs, cG), np.interp(L, xs, cB)], -1)
+    chroma = arr - L[..., None]
+    # taming du vert : reduit la chroma gardee sur pixels verts (g > r,b)
+    sat = np.full(L.shape, p["SAT_RETAIN"])
+    if p["GREEN_TAME"] > 0:
+        g = arr[..., 1]
+        greenness = np.clip(g - np.maximum(arr[..., 0], arr[..., 2]), 0, 1)
+        sat = sat * (1 - p["GREEN_TAME"] * np.clip(greenness * 6, 0, 1))
+    out = base + sat[..., None] * chroma
+    return np.clip(out, 0, 1)
+
+
+def write_cube(p):
+    cR, cG, cB = shaped_curves(p)
+    xs = np.linspace(0, 1, 256)
+    grid = np.linspace(0, 1, N)
+    # vectorise : construit toutes les entrees du cube
+    R, G, B = np.meshgrid(grid, grid, grid, indexing="ij")
+    # ordre .cube : r varie le plus vite => iterer b,g,r ; on remappe
+    pts = np.stack([R, G, B], -1)  # [N,N,N,3] indice [ir,ig,ib]
+    flat = pts.reshape(-1, 3)
+    graded = grade_array(flat[None, :, :], cR, cG, cB, p)[0]
+    # reordonne pour ecriture (b lent, r rapide)
+    graded = graded.reshape(N, N, N, 3)  # [ir,ig,ib]
+    head = [
+        "# Villeneuve Dune - palette transfer pixel par pixel de Dune (1).png",
+        f"# {p}",
+        'TITLE "Villeneuve Dune"', f"LUT_3D_SIZE {N}",
+        "DOMAIN_MIN 0.0 0.0 0.0", "DOMAIN_MAX 1.0 1.0 1.0", "",
+    ]
+    lines = []
+    for ib in range(N):
+        for ig in range(N):
+            for ir in range(N):
+                r, g, b = graded[ir, ig, ib]
+                lines.append(f"{r:.6f} {g:.6f} {b:.6f}")
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    with open(OUT, "w") as f:
+        f.write("\n".join(head + lines) + "\n")
+    return cR, cG, cB
+
+
+def load_small(path, w=520):
+    img = Image.open(path).convert("RGB")
+    if img.width > w:
+        img = img.resize((w, int(img.height * w / img.width)))
+    return np.asarray(img, dtype=np.float64) / 255.0
+
+
+def sweep():
+    cache = {}
+    foot = load_small(FOOTAGE) if os.path.exists(FOOTAGE) else None
+    dune = load_small(REF)
+    names = ["v1", "A", "B", "C"]
+    rows = []
+    for src, label in ([(foot, "FOOTAGE")] if foot is not None else []) + [(dune, "DUNE-ref")]:
+        h, w, _ = src.shape
+        panels = [src]  # original en premier
+        for nm in names:
+            p = PRESETS[nm]
+            cR, cG, cB = cache.get(nm) or cache.setdefault(nm, shaped_curves(p))
+            panels.append(grade_array(src, cR, cG, cB, p))
+        strip = np.concatenate(panels, axis=1)
+        rows.append(strip)
+    # pad rows a meme largeur
+    maxw = max(r.shape[1] for r in rows)
+    rows = [np.pad(r, ((0, 0), (0, maxw - r.shape[1]), (0, 0))) for r in rows]
+    grid = np.concatenate(rows, axis=0)
+    Image.fromarray((grid * 255).astype(np.uint8)).save("/tmp/dune_sweep.png")
+    print("grille : /tmp/dune_sweep.png  (colonnes: ORIG | " + " | ".join(names) + ")")
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "sweep"
+    if mode == "sweep":
+        sweep()
+    elif mode == "compare":
+        compare(sys.argv[2].split(",") if len(sys.argv) > 2 else ["A", "D", "B"])
+    elif mode == "final":
+        preset = sys.argv[2] if len(sys.argv) > 2 else "A"
+        write_cube(PRESETS[preset])
+        print(f"LUT ecrite (preset {preset}) :", os.path.abspath(OUT))
