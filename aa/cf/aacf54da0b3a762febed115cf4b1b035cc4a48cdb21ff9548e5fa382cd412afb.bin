@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Genere une LUT .cube 'Nolan Tenet' : teal dans les ombres, orange chaud
+dans les tons moyens/peaux, hautes lumieres legerement froides, contraste
+en S, leger desaturation globale. Sortie : NolanTenet.cube (33x33x33)."""
+
+import os, math
+
+N = 33  # resolution du cube (33 = standard DaVinci)
+OUT = os.path.join(os.path.dirname(__file__), "..", "LUTs", "NolanTenet.cube")
+
+
+def smoothstep(a, b, x):
+    if x <= a:
+        return 0.0
+    if x >= b:
+        return 1.0
+    t = (b - x) and (x - a) / (b - a)
+    return t * t * (3 - 2 * t)
+
+
+def s_contrast(v, amount=0.05, pivot=0.45):
+    """Courbe en S TRES douce : Dune a un contraste plat, ombres relevees."""
+    x = v - pivot
+    x = x + amount * math.sin(math.pi * max(-1, min(1, x / max(pivot, 1 - pivot))))
+    return max(0.0, min(1.0, x + pivot))
+
+
+def grade(r, g, b):
+    # luminance approx
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    # poids ombres / lumieres
+    shadow = 1.0 - smoothstep(0.0, 0.55, lum)   # fort dans les noirs
+    high = smoothstep(0.5, 1.0, lum)            # fort dans les blancs
+    mid = 1.0 - abs(lum - 0.45) * 2.0
+    mid = max(0.0, mid)
+
+    # --- Look Dune : ambre/orange chaud partout, presque monochrome ---
+    # ombres : a peine refroidies (juste un soupcon, pas de vrai teal)
+    r -= 0.010 * shadow
+    b += 0.018 * shadow
+
+    # tons moyens / peaux -> orange ambre, dominante principale
+    r += 0.075 * mid
+    g += 0.030 * mid
+    b -= 0.060 * mid
+
+    # hautes lumieres -> chaudes et sableuses (pas de blanc froid)
+    r += 0.030 * high
+    g += 0.012 * high
+    b -= 0.030 * high
+
+    # leger relevement des noirs (look delave, doux, Dune)
+    lift = 0.012
+    r = r + lift * (1 - r)
+    g = g + lift * (1 - g)
+    b = b + lift * (1 - b)
+
+    # --- Contraste en S tres doux ---
+    r = s_contrast(r)
+    g = s_contrast(g)
+    b = s_contrast(b)
+
+    # --- Desaturation douce mais marquee (~75%, look Dune) ---
+    lum2 = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    sat = 0.75
+    r = lum2 + (r - lum2) * sat
+    g = lum2 + (g - lum2) * sat
+    b = lum2 + (b - lum2) * sat
+
+    return (max(0.0, min(1.0, r)),
+            max(0.0, min(1.0, g)),
+            max(0.0, min(1.0, b)))
+
+
+def main():
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    lines = [
+        "# Nolan Tenet look LUT - teal/orange split tone + S-contrast",
+        "TITLE \"Nolan Tenet\"",
+        f"LUT_3D_SIZE {N}",
+        "DOMAIN_MIN 0.0 0.0 0.0",
+        "DOMAIN_MAX 1.0 1.0 1.0",
+        "",
+    ]
+    # ordre .cube : b varie le plus lentement, r le plus vite
+    for ib in range(N):
+        for ig in range(N):
+            for ir in range(N):
+                r = ir / (N - 1)
+                g = ig / (N - 1)
+                b = ib / (N - 1)
+                nr, ng, nb = grade(r, g, b)
+                lines.append(f"{nr:.6f} {ng:.6f} {nb:.6f}")
+    with open(OUT, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("LUT ecrite :", os.path.abspath(OUT))
+
+
+if __name__ == "__main__":
+    main()
